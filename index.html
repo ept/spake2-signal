@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+</head>
+<body>
+<!-- To test this, run `python -m SimpleHTTPServer` then open http://localhost:8000/ -->
+
+<!-- https://github.com/signalapp/libsignal-protocol-javascript
+    This library doesn't seem to like being imported, so we just include it as a
+    script tag and let it set up its global variables. -->
+<script src="./libsignal-protocol/libsignal-protocol.js"></script>
+
+<script type="module">
+import init, * as spake2 from './spake2/spake2_wasm.js';
+
+const appId = 'backchannel/app/mailbox/v1';
+const password = 'supersecret';
+const IV_LENGTH = 12; // 96 bits, as per AES-GCM spec
+const PRE_KEY_ID = 0; // our protocol only generates one pre-key
+
+class Peer {
+  // Generates the SPAKE2 message to send to the other peer
+  async step1(password) {
+    // Start the SPAKE2 protocol
+    this.spakeState = spake2.start(appId, password);
+    return spake2.msg(this.spakeState);
+  }
+
+  // Receives the SPAKE2 message and returns a key setup message to send to the other peer
+  async step2(message) {
+    // If both peers had the same password and there was no person-in-the-middle
+    // attack, then both peers will have the same secret here. But we don't yet
+    // know whether that is the case or not.
+    const secret = spake2.finish(this.spakeState, message);
+    this.key = await window.crypto.subtle.importKey('raw', secret, 'AES-GCM', true, ['encrypt', 'decrypt']);
+
+    // Generate the Signal key material
+    const registrationId = libsignal.KeyHelper.generateRegistrationId();
+    const identityKeyPair = await libsignal.KeyHelper.generateIdentityKeyPair();
+    const preKey = await libsignal.KeyHelper.generatePreKey(PRE_KEY_ID);
+    const signedPreKey = await libsignal.KeyHelper.generateSignedPreKey(identityKeyPair, PRE_KEY_ID);
+    this.store = new SignalProtocolStore();
+    this.store.put('identityKey', identityKeyPair);
+
+    // Make a message containing the various bits of Signal key material we need to send.
+    const plaintext = new Uint8Array(6 + identityKeyPair.pubKey.byteLength +
+      preKey.keyPair.pubKey.byteLength + signedPreKey.keyPair.pubKey.byteLength +
+      signedPreKey.signature.byteLength);
+    plaintext[0] = registrationId & 0xff; // The registrationId is always 16 bits
+    plaintext[1] = registrationId >> 8;
+    plaintext[2] = identityKeyPair.pubKey.byteLength;
+    plaintext[3] = preKey.keyPair.pubKey.byteLength;
+    plaintext[4] = signedPreKey.keyPair.pubKey.byteLength;
+    plaintext[5] = signedPreKey.signature.byteLength;
+    let offset = 6;
+    plaintext.set(new Uint8Array(identityKeyPair.pubKey), offset);
+    offset += identityKeyPair.pubKey.byteLength;
+    plaintext.set(new Uint8Array(preKey.keyPair.pubKey), offset);
+    offset += preKey.keyPair.pubKey.byteLength;
+    plaintext.set(new Uint8Array(signedPreKey.keyPair.pubKey), offset);
+    offset += signedPreKey.keyPair.pubKey.byteLength;
+    plaintext.set(new Uint8Array(signedPreKey.signature), offset);
+
+    // Encrypt the Signal key material with the key that is shared (if all went well)
+    const iv = window.crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+    const ciphertext = await window.crypto.subtle.encrypt({name: 'AES-GCM', iv}, this.key, plaintext);
+
+    // Concatenate IV and ciphertext into the message to send
+    const result = new Uint8Array(IV_LENGTH + ciphertext.byteLength);
+    result.set(iv, 0);
+    result.set(new Uint8Array(ciphertext), IV_LENGTH);
+    return result;
+  }
+
+  async step3(message) {
+    // Decrypt the message. This will fail (due to invalid authentication tag)
+    // if the passwords didn't match or if someone interfered with our packets.
+    const iv = message.subarray(0, IV_LENGTH);
+    const ciphertext = message.subarray(IV_LENGTH);
+    const decrypted = await window.crypto.subtle.decrypt({name: 'AES-GCM', iv}, this.key, ciphertext);
+
+    // If we got to this point, decryption succeeded, which means the password
+    // was correct and nobody interfered. Parse out the Signal key material.
+    const plaintext = new Uint8Array(decrypted);
+    const registrationId = plaintext[0] | (plaintext[1] << 8);
+    let offset = 6;
+    const identityKey = plaintext.subarray(offset, offset + plaintext[2]);
+    offset += plaintext[2];
+    const preKey = plaintext.subarray(offset, offset + plaintext[3]);
+    offset += plaintext[3];
+    const signedPreKey = plaintext.subarray(offset, offset + plaintext[4]);
+    offset += plaintext[4];
+    const signature = plaintext.subarray(offset, offset + plaintext[5]);
+
+    // In the standard use of the Signal protocol, recipientId is a phone number.
+    // Need to check what purpose it has. We can probably just make it a constant.
+    const address = new libsignal.SignalProtocolAddress('recipient', 1);
+    const sessionBuilder = new libsignal.SessionBuilder(this.store, address);
+
+    return await sessionBuilder.processPreKey({
+      registrationId,
+      identityKey,
+      signedPreKey: {keyId: PRE_KEY_ID, publicKey: signedPreKey, signature},
+      preKey: {keyId: PRE_KEY_ID, publicKey: preKey}
+    });
+  }
+}
+
+// Based on https://github.com/signalapp/libsignal-protocol-javascript/blob/master/test/InMemorySignalProtocolStore.js
+class SignalProtocolStore {
+  constructor() {
+    this.Direction = {SENDING: 1, RECEIVING: 2};
+    this.store = {};
+  }
+
+  put(key, value) {
+    if (key === undefined || value === undefined || key === null || value === null)
+      throw new Error("Tried to store undefined/null");
+    this.store[key] = value;
+  }
+
+  get(key, defaultValue) {
+    if (key === null || key === undefined)
+      throw new Error("Tried to get value for undefined/null key");
+    if (key in this.store) {
+      return this.store[key];
+    } else {
+      return defaultValue;
+    }
+  }
+
+  remove(key) {
+    if (key === null || key === undefined)
+      throw new Error("Tried to remove value for undefined/null key");
+    delete this.store[key];
+  }
+
+  // Get the local client's identity key pair.
+  getIdentityKeyPair() {
+    return Promise.resolve(this.get('identityKey'));
+  }
+
+  // Return the local client's registration ID.
+  // Clients should maintain a registration ID, a random number
+  // between 1 and 16380 that's generated once at install time.
+  getLocalRegistrationId() {
+    return Promise.resolve(this.get('registrationId'));
+  }
+
+  // Determine whether a remote client's identity is trusted. The Signal protocol
+  // uses 'trust on first use.'  This means that an identity key is considered
+  // 'trusted' if there is no entry for the recipient in the local store, or if
+  // it matches the saved key for a recipient in the local store.  Only if it
+  // mismatches an entry in the local store is it considered 'untrusted.'
+  isTrustedIdentity(identifier, identityKey, direction) {
+    if (identifier === null || identifier === undefined) {
+      throw new Error("tried to check identity key for undefined/null key");
+    }
+    if (!(identityKey instanceof Uint8Array)) {
+      throw new Error("Expected identityKey to be an Uint8Array");
+    }
+    var trusted = this.get('identityKey' + identifier);
+    if (trusted === undefined) {
+      return Promise.resolve(true);
+    }
+    return Promise.resolve(util.toString(identityKey) === util.toString(trusted));
+  }
+
+  loadIdentityKey(identifier) {
+    if (identifier === null || identifier === undefined)
+      throw new Error("Tried to get identity key for undefined/null key");
+    return Promise.resolve(this.get('identityKey' + identifier));
+  }
+
+  // Save a remote client's identity key, marking it as trusted.
+  saveIdentity(identifier, identityKey) {
+    if (identifier === null || identifier === undefined)
+      throw new Error("Tried to put identity key for undefined/null key");
+
+    var address = new libsignal.SignalProtocolAddress.fromString(identifier);
+
+    var existing = this.get('identityKey' + address.getName());
+    this.put('identityKey' + address.getName(), identityKey)
+
+    if (existing && util.toString(identityKey) !== util.toString(existing)) {
+      return Promise.resolve(true);
+    } else {
+      return Promise.resolve(false);
+    }
+  }
+
+  // Load a local serialized PreKey record.
+  loadPreKey(keyId) {
+    var res = this.get('25519KeypreKey' + keyId);
+    if (res !== undefined) {
+      res = { pubKey: res.pubKey, privKey: res.privKey };
+    }
+    return Promise.resolve(res);
+  }
+
+  // Store a local serialized PreKey record.
+  storePreKey(keyId, keyPair) {
+    return Promise.resolve(this.put('25519KeypreKey' + keyId, keyPair));
+  }
+
+  // Delete a PreKey record from local storage.
+  removePreKey(keyId) {
+    return Promise.resolve(this.remove('25519KeypreKey' + keyId));
+  }
+
+  // Load a local serialized signed PreKey record.
+  loadSignedPreKey(keyId) {
+    var res = this.get('25519KeysignedKey' + keyId);
+    if (res !== undefined) {
+      res = { pubKey: res.pubKey, privKey: res.privKey };
+    }
+    return Promise.resolve(res);
+  }
+
+  // Store a local serialized signed PreKey record.
+  storeSignedPreKey(keyId, keyPair) {
+    return Promise.resolve(this.put('25519KeysignedKey' + keyId, keyPair));
+  }
+
+  // Delete a SignedPreKeyRecord from local storage.
+  removeSignedPreKey(keyId) {
+    return Promise.resolve(this.remove('25519KeysignedKey' + keyId));
+  }
+
+  // Returns a copy of the serialized session record corresponding to the
+  // provided recipient ID + device ID tuple.
+  loadSession(identifier) {
+    return Promise.resolve(this.get('session' + identifier));
+  }
+
+  // Writes to storage the session record for a given recipient ID + device
+  // ID tuple.
+  storeSession(identifier, record) {
+    return Promise.resolve(this.put('session' + identifier, record));
+  }
+
+  // Remove a session record for a recipient ID + device ID tuple.
+  removeSession(identifier) {
+    return Promise.resolve(this.remove('session' + identifier));
+  }
+
+  // Remove the session records corresponding to all devices of a recipient ID.
+  removeAllSessions(identifier) {
+    for (let key of Object.keys(this.store)) {
+      if (key.startsWith('session' + identifier)) {
+        delete this.store[key];
+      }
+    }
+    return Promise.resolve();
+  }
+}
+
+async function run() {
+  await init();
+
+  const peer1 = new Peer(), peer2 = new Peer();
+  const msg1a = await peer1.step1(password), msg1b = await peer2.step1(password);
+  const msg2a = await peer1.step2(msg1b), msg2b = await peer2.step2(msg1a);
+  const msg3a = await peer1.step3(msg2b), msg3b = await peer2.step3(msg2a);
+  console.log(peer1.store);
+  console.log(peer2.store);
+}
+run();
+</script>
+</body>
+</html>
