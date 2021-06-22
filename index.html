@@ -14,17 +14,37 @@
 <script type="module">
 import init, * as spake2 from './spake2/spake2_wasm.js';
 
-const appId = 'backchannel/app/mailbox/v1';
 const password = 'supersecret';
-const IV_LENGTH = 12; // 96 bits, as per AES-GCM spec
-const PRE_KEY_ID = 0; // our protocol only generates one pre-key
+
+const APP_ID = 'backchannel/app/mailbox/v1';
+const KEY_CONFIRMATION = new TextEncoder().encode(APP_ID);
+const HMAC_LENGTH = 32; // SHA-256
+const IV_LENGTH = 16; // 128 bits
+const PRE_KEY_ID = 1; // our protocol only generates one pre-key
+const INITIAL_MESSAGE = new TextEncoder().encode('backchannel v1 initial message');
+
+// In the standard use of the Signal protocol, recipientId is a phone number.
+// Need to check what purpose it has. We can probably just make it a constant.
+const SIGNAL_ADDRESS = new libsignal.SignalProtocolAddress('recipient', 1);
+
+// Returns true if the two byte arrays have the same content.
+function compareByteArrays(arr1, arr2) {
+  if (!(arr1 instanceof Uint8Array)) arr1 = new Uint8Array(arr1);
+  if (!(arr2 instanceof Uint8Array)) arr2 = new Uint8Array(arr2);
+  if (arr1.byteLength !== arr2.byteLength) return false;
+  for (let i = 0; i < arr1.byteLength; i++) {
+    if (arr1[i] !== arr2[i]) return false;
+  }
+  return true;
+}
 
 class Peer {
   // Generates the SPAKE2 message to send to the other peer
   async step1(password) {
     // Start the SPAKE2 protocol
-    this.spakeState = spake2.start(appId, password);
-    return spake2.msg(this.spakeState);
+    this.spakeState = spake2.start(APP_ID, password);
+    this.sentSpakeMsg = spake2.msg(this.spakeState);
+    return this.sentSpakeMsg;
   }
 
   // Receives the SPAKE2 message and returns a key setup message to send to the other peer
@@ -32,8 +52,8 @@ class Peer {
     // If both peers had the same password and there was no person-in-the-middle
     // attack, then both peers will have the same secret here. But we don't yet
     // know whether that is the case or not.
-    const secret = spake2.finish(this.spakeState, message);
-    this.key = await window.crypto.subtle.importKey('raw', secret, 'AES-GCM', true, ['encrypt', 'decrypt']);
+    this.spakeSecret = spake2.finish(this.spakeState, message);
+    this.receivedSpakeMsg = message;
 
     // Generate the Signal key material
     const registrationId = libsignal.KeyHelper.generateRegistrationId();
@@ -41,7 +61,10 @@ class Peer {
     const preKey = await libsignal.KeyHelper.generatePreKey(PRE_KEY_ID);
     const signedPreKey = await libsignal.KeyHelper.generateSignedPreKey(identityKeyPair, PRE_KEY_ID);
     this.store = new SignalProtocolStore();
+    this.store.put('registrationId', registrationId);
     this.store.put('identityKey', identityKeyPair);
+    this.store.storePreKey(PRE_KEY_ID, preKey.keyPair);
+    this.store.storeSignedPreKey(PRE_KEY_ID, signedPreKey.keyPair);
 
     // Make a message containing the various bits of Signal key material we need to send.
     const plaintext = new Uint8Array(6 + identityKeyPair.pubKey.byteLength +
@@ -64,46 +87,122 @@ class Peer {
 
     // Encrypt the Signal key material with the key that is shared (if all went well)
     const iv = window.crypto.getRandomValues(new Uint8Array(IV_LENGTH));
-    const ciphertext = await window.crypto.subtle.encrypt({name: 'AES-GCM', iv}, this.key, plaintext);
+    const key = await window.crypto.subtle.importKey('raw', this.spakeSecret, 'AES-GCM', true, ['encrypt']);
+    const ciphertext = await window.crypto.subtle.encrypt({name: 'AES-GCM', iv}, key, plaintext);
 
-    // Concatenate IV and ciphertext into the message to send
-    const result = new Uint8Array(IV_LENGTH + ciphertext.byteLength);
-    result.set(iv, 0);
-    result.set(new Uint8Array(ciphertext), IV_LENGTH);
+    // Since AES-GCM does not provide random key robustness -- it is not a committing
+    // encryption scheme, see https://soatok.blog/2020/05/13/why-aes-gcm-sucks/ -- we
+    // also generate a HMAC commitment to check both peers have derived the same secret.
+    const hmacKey = await window.crypto.subtle.importKey('raw', this.spakeSecret, {name: 'HMAC', hash: 'SHA-256'}, true, ['sign']);
+    const hmac = await window.crypto.subtle.sign('HMAC', hmacKey, KEY_CONFIRMATION);
+    if (hmac.byteLength !== HMAC_LENGTH) throw new Error('bad HMAC length');
+
+    // Concatenate HMAC, IV and ciphertext into the message to send
+    const result = new Uint8Array(HMAC_LENGTH + IV_LENGTH + ciphertext.byteLength);
+    result.set(new Uint8Array(hmac), 0);
+    result.set(iv, HMAC_LENGTH);
+    result.set(new Uint8Array(ciphertext), HMAC_LENGTH + IV_LENGTH);
     return result;
   }
 
   async step3(message) {
-    // Decrypt the message. This will fail (due to invalid authentication tag)
-    // if the passwords didn't match or if someone interfered with our packets.
-    const iv = message.subarray(0, IV_LENGTH);
-    const ciphertext = message.subarray(IV_LENGTH);
-    const decrypted = await window.crypto.subtle.decrypt({name: 'AES-GCM', iv}, this.key, ciphertext);
+    // Check the HMAC. This will fail if the passwords didn't match or if
+    // someone interfered with our packets.
+    const hmacKey = await window.crypto.subtle.importKey('raw', this.spakeSecret, {name: 'HMAC', hash: 'SHA-256'}, true, ['verify']);
+    const hmac = message.subarray(0, HMAC_LENGTH);
+    const success = await window.crypto.subtle.verify('HMAC', hmacKey, hmac, KEY_CONFIRMATION);
+    if (success !== true) {
+      throw new Error('SPAKE2 handshake failed: wrong password or someone interfered with communication');
+    }
+
+    // Decrypt the message. This should fail only if the message was corrupted.
+    const iv = message.subarray(HMAC_LENGTH, HMAC_LENGTH + IV_LENGTH);
+    const ciphertext = message.subarray(HMAC_LENGTH + IV_LENGTH);
+    const key = await window.crypto.subtle.importKey('raw', this.spakeSecret, 'AES-GCM', true, ['decrypt']);
+    const plaintext = await window.crypto.subtle.decrypt({name: 'AES-GCM', iv}, key, ciphertext);
 
     // If we got to this point, decryption succeeded, which means the password
     // was correct and nobody interfered. Parse out the Signal key material.
-    const plaintext = new Uint8Array(decrypted);
-    const registrationId = plaintext[0] | (plaintext[1] << 8);
+    const byteArray = new Uint8Array(plaintext);
+    const registrationId = byteArray[0] | (byteArray[1] << 8);
     let offset = 6;
-    const identityKey = plaintext.subarray(offset, offset + plaintext[2]);
-    offset += plaintext[2];
-    const preKey = plaintext.subarray(offset, offset + plaintext[3]);
-    offset += plaintext[3];
-    const signedPreKey = plaintext.subarray(offset, offset + plaintext[4]);
-    offset += plaintext[4];
-    const signature = plaintext.subarray(offset, offset + plaintext[5]);
+    this.peerIdentityKey = plaintext.slice(offset, offset + byteArray[2]);
+    offset += byteArray[2];
+    const preKey = plaintext.slice(offset, offset + byteArray[3]);
+    offset += byteArray[3];
+    const signedPreKey = plaintext.slice(offset, offset + byteArray[4]);
+    offset += byteArray[4];
+    const signature = plaintext.slice(offset, offset + byteArray[5]);
 
-    // In the standard use of the Signal protocol, recipientId is a phone number.
-    // Need to check what purpose it has. We can probably just make it a constant.
-    const address = new libsignal.SignalProtocolAddress('recipient', 1);
-    const sessionBuilder = new libsignal.SessionBuilder(this.store, address);
+    // Signal protocol requires that a session is set up by having one peer send
+    // an initial message to the other (not both sending messages to each other).
+    // That means we have to choose which of the two peers is going to send the
+    // message, since up to this point the protocol has been symmetric. We choose
+    // a peer based on lexicographic ordering of the SPAKE2 messages. Since the
+    // SPAKE2 shared secret includes a hash over the messages sent and received,
+    // we know that both peers agree on the content of the SPAKE2 messages.
+    for (let i = 0; ; i++) {
+      if (i === this.sentSpakeMsg.byteLength) throw new Error('SPAKE2 messages are identical');
+      if (this.sentSpakeMsg[i] < this.receivedSpakeMsg[i]) return;
+      if (this.sentSpakeMsg[i] > this.receivedSpakeMsg[i]) break;
+    }
 
-    return await sessionBuilder.processPreKey({
+    // We get here if sentSpakeMsg is greater than receivedSpakeMsg. That means
+    // it's our job to initiate the Signal protocol setup.
+    const sessionBuilder = new libsignal.SessionBuilder(this.store, SIGNAL_ADDRESS);
+    await sessionBuilder.processPreKey({
       registrationId,
-      identityKey,
+      identityKey: this.peerIdentityKey,
       signedPreKey: {keyId: PRE_KEY_ID, publicKey: signedPreKey, signature},
       preKey: {keyId: PRE_KEY_ID, publicKey: preKey}
     });
+
+    const session = new libsignal.SessionCipher(this.store, SIGNAL_ADDRESS);
+    return await session.encrypt(INITIAL_MESSAGE);
+  }
+
+  async step4(message) {
+    // Only one of the two peers in step3 sent a message. If we didn't receive
+    // a message in that step, we don't need to do anything.
+    if (message === undefined) return;
+
+    // Decrypt the first Signal protocol message, which also sets up the
+    // session state.
+    const session = new libsignal.SessionCipher(this.store, SIGNAL_ADDRESS);
+    if (message.type !== 3) throw new Error(`Unexpected message type: ${message.type}`);
+    const decrypted = await session.decryptPreKeyWhisperMessage(message.body, 'binary');
+    if (!compareByteArrays(decrypted, INITIAL_MESSAGE)) throw new Error('initial message mismatch');
+
+    // Check that the identity key of the established Signal session matches
+    // the one we received in step3. This binds the Signal session to the
+    // successful SPAKE2 handshake.
+    const sessionIdentityKey = await this.store.loadIdentityKey(SIGNAL_ADDRESS.getName());
+    if (!compareByteArrays(sessionIdentityKey, this.peerIdentityKey)) {
+      throw new Error('Signal session identity key mismatch')
+    }
+    // If we got here without any exceptions, the Signal session is correctly set up.
+  }
+
+  // Encrypts a message to the peer using the Signal session. Returns the encrypted message.
+  async send(message) {
+    const session = new libsignal.SessionCipher(this.store, SIGNAL_ADDRESS);
+    return await session.encrypt(message);
+  }
+
+  // Decrypts a message that was encrypted by `send()`.
+  async receive(message) {
+    const session = new libsignal.SessionCipher(this.store, SIGNAL_ADDRESS);
+    let decrypted;
+    if (message.type === 1) { // textsecure.protobuf.IncomingPushMessageSignal.Type.CIPHERTEXT
+      decrypted = await session.decryptWhisperMessage(message.body, 'binary');
+    } else if (message.type === 3) { // textsecure.protobuf.IncomingPushMessageSignal.Type.PREKEY_BUNDLE
+      decrypted = await session.decryptPreKeyWhisperMessage(message.body, 'binary');
+    } else {
+      throw new Error(`Unknown message type: ${message.type}`)
+    }
+
+    // Convert ArrayBuffer to string
+    return new TextDecoder('utf-8').decode(decrypted);
   }
 }
 
@@ -154,17 +253,7 @@ class SignalProtocolStore {
   // it matches the saved key for a recipient in the local store.  Only if it
   // mismatches an entry in the local store is it considered 'untrusted.'
   isTrustedIdentity(identifier, identityKey, direction) {
-    if (identifier === null || identifier === undefined) {
-      throw new Error("tried to check identity key for undefined/null key");
-    }
-    if (!(identityKey instanceof Uint8Array)) {
-      throw new Error("Expected identityKey to be an Uint8Array");
-    }
-    var trusted = this.get('identityKey' + identifier);
-    if (trusted === undefined) {
-      return Promise.resolve(true);
-    }
-    return Promise.resolve(util.toString(identityKey) === util.toString(trusted));
+    return Promise.resolve(true);
   }
 
   loadIdentityKey(identifier) {
@@ -178,21 +267,14 @@ class SignalProtocolStore {
     if (identifier === null || identifier === undefined)
       throw new Error("Tried to put identity key for undefined/null key");
 
-    var address = new libsignal.SignalProtocolAddress.fromString(identifier);
-
-    var existing = this.get('identityKey' + address.getName());
+    const address = new libsignal.SignalProtocolAddress.fromString(identifier);
     this.put('identityKey' + address.getName(), identityKey)
-
-    if (existing && util.toString(identityKey) !== util.toString(existing)) {
-      return Promise.resolve(true);
-    } else {
-      return Promise.resolve(false);
-    }
+    return Promise.resolve(false);
   }
 
   // Load a local serialized PreKey record.
   loadPreKey(keyId) {
-    var res = this.get('25519KeypreKey' + keyId);
+    let res = this.get('25519KeypreKey' + keyId);
     if (res !== undefined) {
       res = { pubKey: res.pubKey, privKey: res.privKey };
     }
@@ -211,7 +293,7 @@ class SignalProtocolStore {
 
   // Load a local serialized signed PreKey record.
   loadSignedPreKey(keyId) {
-    var res = this.get('25519KeysignedKey' + keyId);
+    let res = this.get('25519KeysignedKey' + keyId);
     if (res !== undefined) {
       res = { pubKey: res.pubKey, privKey: res.privKey };
     }
@@ -263,8 +345,13 @@ async function run() {
   const msg1a = await peer1.step1(password), msg1b = await peer2.step1(password);
   const msg2a = await peer1.step2(msg1b), msg2b = await peer2.step2(msg1a);
   const msg3a = await peer1.step3(msg2b), msg3b = await peer2.step3(msg2a);
-  console.log(peer1.store);
-  console.log(peer2.store);
+  await peer1.step4(msg3b);
+  await peer2.step4(msg3a);
+
+  // Now the peers can send each other messages
+  console.log(await peer1.receive(await peer2.send('Hello world!')));
+  console.log(await peer1.receive(await peer2.send('How are you doing?')));
+  console.log(await peer2.receive(await peer1.send('Pretty good, thanks. And you?')));
 }
 run();
 </script>
