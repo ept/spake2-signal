@@ -12,8 +12,9 @@ if all you have is their phone number? In Signal's case, there is essentially a
 trusted database server. You query the server with the phone number of your contact,
 and you get back their public key. You have to trust that the server gives you the
 correct key. If the server instead gives you the NSA's public key, would you ever
-notice? (You would notice if you compare security numbers, but honestly, who ever
-does that? Probably only the kind of person who used to attend
+notice? (You would notice if you compare
+[safety numbers](https://support.signal.org/hc/en-us/articles/360007060632-What-is-a-safety-number-and-why-do-I-see-that-it-changed-),
+but honestly, who ever does that? Probably only the kind of person who used to attend
 [PGP key signing parties](https://en.wikipedia.org/wiki/Key_signing_party).)
 
 This repository is a proof-of-concept of using the Signal protocol without a
@@ -44,8 +45,8 @@ properties:
   Alice and Bob each send a second message in reply; and after receiving the
   second message, one of the two (determined by the protocol) sends a third
   message to the other. This means the protocol takes a total of 3 one-way
-  network delays (1.5 round trips). This means it works best if both users are
-  online at the same time.
+  network delays (1.5 round trips), so it works best if both users are online at
+  the same time.
 * After the protocol completes, both users have a fully initialised Signal
   protocol session that either user can use to send a message to the other.
   Once the session is set up, it's fine for users to go offline, as long as
@@ -56,14 +57,20 @@ properties:
   For example, if Alice is a member of a group and she has just established a
   Signal protocol session with Bob, Alice can now add Bob's public key to the
   group, which will allow every other member of the group to establish a direct
-  Signal session with Bob without having to perform another password exchange.
+  Signal session with Bob without having to perform another PAKE handshake.
 
-The code of this prototype is in `index.html`. It uses a
-Rust implementation of SPAKE2 compiled to WebAssembly, and the
+The code of this prototype is in `index.html`. It doesn't work if you just open
+the file locally in a web browser, because browsers won't load WebAssembly files
+locally. Instead you have to run a minimal web server to serve it on localhost.
+For example, run `python -m SimpleHTTPServer` and then open
+http://localhost:8000/ in your web browser. The page is blank; open the
+JavaScript console to see the output.
+
+This prototype uses a Rust implementation of SPAKE2 compiled to WebAssembly, and the
 [JavaScript implementation of libsignal-protocol](https://github.com/signalapp/libsignal-protocol-javascript).
 Most of the code of the prototype only really exists in order to satisfy
 libsignal-protocol's rather obtuse and poorly-documented API.
 
-This is a proof-of-concept prototype that has not undergone any review or testing,
+This is a proof-of-concept prototype that has not undergone any review, testing,
 or verification. Use it at your own risk under the terms of the
 [MIT license](https://opensource.org/licenses/MIT), with no warranty whatsoever.
