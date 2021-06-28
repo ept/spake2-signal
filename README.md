@@ -73,4 +73,10 @@ libsignal-protocol's rather obtuse and poorly-documented API.
 
 This is a proof-of-concept prototype that has not undergone any review, testing,
 or verification. Use it at your own risk under the terms of the
-[MIT license](https://opensource.org/licenses/MIT), with no warranty whatsoever.
+[GNU General Public License, Version 3](http://www.gnu.org/licenses/gpl-3.0.html),
+with no warranty whatsoever. I
+[don't like the GPL](https://martin.kleppmann.com/2021/04/14/goodbye-gpl.html),
+but libsignal-protocol is licensed under the GPLv3, so I'm afraid this prototype
+has to be licensed in the same way.
+
+Copyright 2021 Martin Kleppmann. See `LICENSE` for licensing terms.
