@@ -67,7 +67,8 @@ http://localhost:8000/ in your web browser. The page is blank; open the
 JavaScript console to see the output.
 
 This prototype uses a
-[Rust implementation of SPAKE2 compiled to WebAssembly](https://github.com/okdistribute/spake2-wasm), and the
+[Rust implementation](https://github.com/rustcrypto/pakes/tree/HEAD/spake2) of SPAKE2
+[compiled to WebAssembly](https://github.com/okdistribute/spake2-wasm), and the
 [JavaScript implementation of libsignal-protocol](https://github.com/signalapp/libsignal-protocol-javascript).
 Most of the code of the prototype only really exists in order to satisfy
 libsignal-protocol's rather obtuse and poorly-documented API.
